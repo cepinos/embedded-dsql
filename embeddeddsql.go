@@ -41,10 +41,20 @@ type Options struct {
 	RuntimeDir string
 	// Port is the loopback port of the DSN. 0 picks a free port.
 	Port int
-	// PostgresVersion is the zonky embedded-postgres-binaries version.
-	// Default: DefaultPostgresVersion. Only versions with pinned checksums
-	// are accepted.
+	// PostgresVersion is the zonky embedded-postgres-binaries version, any
+	// version published to the repository. Default: DefaultPostgresVersion.
+	// Versions with a pinned checksum are verified against the pin; others
+	// against BinarySHA256 or the repository's <jar>.sha256 file.
 	PostgresVersion string
+	// BinaryRepositoryURL is the root of the Maven repository serving the
+	// zonky jars (a Maven Central mirror or proxy). Default:
+	// DefaultBinaryRepositoryURL. A trailing slash is ignored. Pinned
+	// versions are still verified against the pin.
+	BinaryRepositoryURL string
+	// BinarySHA256 is the hex SHA-256 of the binaries jar. When set, the jar
+	// is verified against it instead of the pinned checksum or the
+	// repository's .sha256 file.
+	BinarySHA256 string
 	// Logger receives PostgreSQL's output and the proxy's connection errors.
 	// Default: discarded.
 	Logger io.Writer
@@ -66,7 +76,7 @@ type DB struct {
 	postmasterP int
 }
 
-// Start downloads (once, verified against a pinned checksum) and starts a
+// Start downloads (once, verified by checksum) and starts a
 // PostgreSQL server, then fronts it with the DSQL validation proxy. Call Stop
 // when done; Stop leaves no process behind.
 func Start(ctx context.Context, opts Options) (*DB, error) {
@@ -76,21 +86,18 @@ func Start(ctx context.Context, opts Options) (*DB, error) {
 	}
 	logf := func(format string, args ...any) { fmt.Fprintf(logw, format+"\n", args...) }
 
-	version := opts.PostgresVersion
-	if version == "" {
-		version = DefaultPostgresVersion
-	}
-	art, err := resolveArtifact(version)
+	art, err := resolveArtifact(opts)
 	if err != nil {
 		return nil, err
 	}
+	version := art.version
 	cacheDir := opts.CacheDir
 	if cacheDir == "" {
 		if cacheDir, err = defaultCacheDir(); err != nil {
 			return nil, err
 		}
 	}
-	archive, err := ensureArchive(ctx, art, cacheDir, logf)
+	archive, archiveSHA256, err := ensureArchive(ctx, art, cacheDir, logf)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +105,7 @@ func Start(ctx context.Context, opts Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	binDir, err := binariesDir(cacheDir, art, as)
+	binDir, err := binariesDir(cacheDir, art, archiveSHA256, as)
 	if err != nil {
 		return nil, err
 	}

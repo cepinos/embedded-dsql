@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -21,9 +22,15 @@ import (
 // Options.PostgresVersion is empty.
 const DefaultPostgresVersion = "16.14.0"
 
-// mavenRepository hosts the zonky embedded-postgres-binaries jars that
+// DefaultBinaryRepositoryURL is the Maven repository the PostgreSQL binaries
+// come from when Options.BinaryRepositoryURL is empty: Maven Central, which
+// hosts the zonky embedded-postgres-binaries jars that
 // github.com/fergusstrange/embedded-postgres consumes.
-const mavenRepository = "https://repo1.maven.org/maven2"
+const DefaultBinaryRepositoryURL = "https://repo1.maven.org/maven2"
+
+// maxChecksumFileSize bounds the <jar>.sha256 response; a real one is a
+// 64-character hex digest, optionally followed by a file name.
+const maxChecksumFileSize = 4096
 
 // checksum pins one binaries jar and the .txz archive inside it.
 type checksum struct {
@@ -82,29 +89,59 @@ func platform() (string, string, error) {
 	return goos, arch, nil
 }
 
-// artifact describes the PostgreSQL binaries for one platform and version.
+// artifact describes the PostgreSQL binaries for one platform and version,
+// and how the downloaded jar is verified.
 type artifact struct {
 	goos, arch, version string
-	sums                checksum
-	repo                string
+	// repo is the Maven repository root, without a trailing slash.
+	repo string
+	// jarSHA256 is the expected SHA-256 of the jar. Empty means it is read
+	// from <jar URL>.sha256 in the same repository.
+	jarSHA256 string
+	// jarSource names where jarSHA256 comes from, for error messages.
+	jarSource string
+	// txzSHA256 is the pinned SHA-256 of the .txz inside the jar; empty for
+	// versions without a pin or when Options.BinarySHA256 is set.
+	txzSHA256 string
 }
 
-func resolveArtifact(version string) (artifact, error) {
+// resolveArtifact applies the defaults of opts and picks the integrity rule:
+// Options.BinarySHA256, else the pinned checksums, else the repository's own
+// .sha256 file.
+func resolveArtifact(opts Options) (artifact, error) {
 	goos, arch, err := platform()
 	if err != nil {
 		return artifact{}, err
 	}
-	key := goos + "-" + arch + "-" + version
-	sums, ok := pinnedChecksums[key]
-	if !ok {
-		known := make([]string, 0, len(pinnedChecksums))
-		for k := range pinnedChecksums {
-			known = append(known, k)
-		}
-		return artifact{}, fmt.Errorf("embedded-dsql: no pinned checksum for PostgreSQL binaries %q (pinned: %s)",
-			key, strings.Join(known, ", "))
+	a := artifact{goos: goos, arch: arch, version: opts.PostgresVersion, repo: opts.BinaryRepositoryURL}
+	if a.version == "" {
+		a.version = DefaultPostgresVersion
 	}
-	return artifact{goos: goos, arch: arch, version: version, sums: sums, repo: mavenRepository}, nil
+	if a.repo == "" {
+		a.repo = DefaultBinaryRepositoryURL
+	}
+	a.repo = strings.TrimRight(a.repo, "/")
+
+	if opts.BinarySHA256 != "" {
+		want := strings.ToLower(strings.TrimSpace(opts.BinarySHA256))
+		if !isSHA256Hex(want) {
+			return artifact{}, fmt.Errorf("embedded-dsql: Options.BinarySHA256 %q is not a hex SHA-256 digest", opts.BinarySHA256)
+		}
+		a.jarSHA256, a.jarSource = want, "Options.BinarySHA256"
+		return a, nil
+	}
+	if sums, ok := pinnedChecksums[goos+"-"+arch+"-"+a.version]; ok {
+		a.jarSHA256, a.txzSHA256, a.jarSource = sums.jar, sums.txz, "the pinned checksum"
+	}
+	return a, nil
+}
+
+func isSHA256Hex(s string) bool {
+	if len(s) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
 }
 
 func (a artifact) name() string {
@@ -160,81 +197,190 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// cachedArchiveValid reports whether the archive in the cache matches its
-// pinned checksum.
-func cachedArchiveValid(path, want string) (bool, error) {
-	got, err := sha256File(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("embedded-dsql: read cached archive %s: %w", path, err)
-	}
-	return got == want, nil
+// recordPath is the verification record kept next to the cached archive: the
+// SHA-256 of the jar it came from and of the archive itself. It lets a
+// version without a pinned archive checksum be reused without a download,
+// and makes a changed expected jar checksum invalidate the cache.
+func (a artifact) recordPath(cacheDir string) string {
+	return a.cachePath(cacheDir) + ".embedded-dsql"
 }
 
-// ensureArchive makes sure the verified .txz is in cacheDir, downloading it
-// under a cross-process lock when it is missing or does not match its pin.
-// It returns the archive path.
-func ensureArchive(ctx context.Context, a artifact, cacheDir string, logf func(string, ...any)) (string, error) {
+type verification struct {
+	jar, txz string
+}
+
+func (v verification) encode() []byte {
+	return []byte("jar " + v.jar + "\ntxz " + v.txz + "\n")
+}
+
+func readVerification(path string) (verification, bool, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return verification{}, false, nil
+	}
+	if err != nil {
+		return verification{}, false, fmt.Errorf("embedded-dsql: read %s: %w", path, err)
+	}
+	var v verification
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, _ := strings.Cut(line, " ")
+		switch key {
+		case "jar":
+			v.jar = value
+		case "txz":
+			v.txz = value
+		}
+	}
+	return v, isSHA256Hex(v.jar) && isSHA256Hex(v.txz), nil
+}
+
+// cachedArchive reports whether the archive in the cache can be used, and
+// its SHA-256. A pinned archive checksum is authoritative; otherwise the
+// archive must match its verification record, and that record's jar must be
+// the expected one when an expected jar checksum is known.
+func cachedArchive(a artifact, cacheDir string) (string, bool, error) {
 	path := a.cachePath(cacheDir)
-	ok, err := cachedArchiveValid(path, a.sums.txz)
-	if err != nil || ok {
-		return path, err
+	got, err := sha256File(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("embedded-dsql: read cached archive %s: %w", path, err)
+	}
+	if a.txzSHA256 != "" {
+		return got, got == a.txzSHA256, nil
+	}
+	v, ok, err := readVerification(a.recordPath(cacheDir))
+	if err != nil || !ok {
+		return "", false, err
+	}
+	if v.txz != got || (a.jarSHA256 != "" && v.jar != a.jarSHA256) {
+		return "", false, nil
+	}
+	return got, true, nil
+}
+
+// ensureArchive makes sure a verified .txz is in cacheDir, downloading it
+// under a cross-process lock when it is missing or cannot be trusted. It
+// returns the archive path and its SHA-256.
+func ensureArchive(ctx context.Context, a artifact, cacheDir string, logf func(string, ...any)) (string, string, error) {
+	path := a.cachePath(cacheDir)
+	txzSum, ok, err := cachedArchive(a, cacheDir)
+	if err != nil {
+		return "", "", err
+	}
+	if ok {
+		return path, txzSum, nil
 	}
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		return "", fmt.Errorf("embedded-dsql: create cache dir %s: %w", cacheDir, err)
+		return "", "", fmt.Errorf("embedded-dsql: create cache dir %s: %w", cacheDir, err)
 	}
 	unlock, err := lockFile(filepath.Join(cacheDir, ".embedded-dsql.lock"))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer unlock()
 
 	// Another process may have fetched it while this one waited.
-	if ok, err := cachedArchiveValid(path, a.sums.txz); err != nil || ok {
-		return path, err
+	if txzSum, ok, err := cachedArchive(a, cacheDir); err != nil || ok {
+		return path, txzSum, err
 	}
 	logf("embedded-dsql: downloading %s to %s", a.url(), path)
-	txz, err := download(ctx, a)
+	txz, v, err := download(ctx, a)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
+	// The archive goes first: a crash before the record is written leaves a
+	// mismatch, which the next start re-downloads.
 	if err := writeAtomic(path, txz, 0o644); err != nil {
-		return "", fmt.Errorf("embedded-dsql: write %s: %w", path, err)
+		return "", "", fmt.Errorf("embedded-dsql: write %s: %w", path, err)
 	}
-	return path, nil
+	if err := writeAtomic(a.recordPath(cacheDir), v.encode(), 0o644); err != nil {
+		return "", "", fmt.Errorf("embedded-dsql: write %s: %w", a.recordPath(cacheDir), err)
+	}
+	return path, v.txz, nil
 }
 
 var httpClient = &http.Client{Timeout: 10 * time.Minute}
 
-// download fetches the jar, checks it against the pinned checksum and returns
-// the verified .txz inside it.
-func download(ctx context.Context, a artifact) ([]byte, error) {
-	url := a.url()
+// get fetches url and returns its body, reading at most limit bytes when
+// limit is positive.
+func get(ctx context.Context, url string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("embedded-dsql: build request for %s: %w", url, err)
+		return nil, fmt.Errorf("build request for %s: %w", url, err)
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("embedded-dsql: download %s: %w", url, err)
+		return nil, err
 	}
-	body, readErr := io.ReadAll(resp.Body)
+	var r io.Reader = resp.Body
+	if limit > 0 {
+		r = io.LimitReader(resp.Body, limit)
+	}
+	body, readErr := io.ReadAll(r)
 	closeErr := resp.Body.Close()
 	if err := errors.Join(readErr, closeErr); err != nil {
-		return nil, fmt.Errorf("embedded-dsql: download %s: %w", url, err)
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("embedded-dsql: download %s: HTTP %s", url, resp.Status)
+		return nil, fmt.Errorf("HTTP %s", resp.Status)
 	}
-	sum := sha256.Sum256(body)
-	if got := hex.EncodeToString(sum[:]); got != a.sums.jar {
-		return nil, fmt.Errorf("embedded-dsql: checksum mismatch for %s: got sha256 %s, pinned %s", url, got, a.sums.jar)
+	return body, nil
+}
+
+// remoteJarChecksum reads <jar URL>.sha256 from the repository. Any failure
+// is fatal: a version without a checksum is never used unverified.
+func remoteJarChecksum(ctx context.Context, a artifact) (string, error) {
+	url := a.url() + ".sha256"
+	body, err := get(ctx, url, maxChecksumFileSize)
+	if err == nil {
+		fields := strings.Fields(string(body))
+		if len(fields) > 0 && isSHA256Hex(strings.ToLower(fields[0])) {
+			return strings.ToLower(fields[0]), nil
+		}
+		err = errors.New("not a hex SHA-256 digest")
+	}
+	return "", fmt.Errorf("embedded-dsql: cannot verify PostgreSQL %s binaries: checksum file %s: %w; "+
+		"set Options.BinarySHA256 to the jar's SHA-256 or use a pinned version (%s)",
+		a.version, url, err, strings.Join(pinnedVersions(a.goos, a.arch), ", "))
+}
+
+// pinnedVersions lists the versions with pinned checksums for a platform.
+func pinnedVersions(goos, arch string) []string {
+	prefix := goos + "-" + arch + "-"
+	var versions []string
+	for key := range pinnedChecksums {
+		if v, ok := strings.CutPrefix(key, prefix); ok && !strings.Contains(v, "-") {
+			versions = append(versions, v)
+		}
+	}
+	sort.Strings(versions)
+	return versions
+}
+
+// download fetches the jar, checks it against the expected checksum and
+// returns the verified .txz inside it with its verification record.
+func download(ctx context.Context, a artifact) ([]byte, verification, error) {
+	want, source := a.jarSHA256, a.jarSource
+	if want == "" {
+		var err error
+		if want, err = remoteJarChecksum(ctx, a); err != nil {
+			return nil, verification{}, err
+		}
+		source = a.url() + ".sha256"
+	}
+	url := a.url()
+	body, err := get(ctx, url, 0)
+	if err != nil {
+		return nil, verification{}, fmt.Errorf("embedded-dsql: download %s: %w", url, err)
+	}
+	if got := sha256Hex(body); got != want {
+		return nil, verification{}, fmt.Errorf("embedded-dsql: checksum mismatch for %s: got sha256 %s, want %s from %s", url, got, want, source)
 	}
 	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 	if err != nil {
-		return nil, fmt.Errorf("embedded-dsql: open jar %s: %w", url, err)
+		return nil, verification{}, fmt.Errorf("embedded-dsql: open jar %s: %w", url, err)
 	}
 	for _, f := range zr.File {
 		if f.FileInfo().IsDir() || !strings.HasSuffix(f.Name, ".txz") {
@@ -242,15 +388,20 @@ func download(ctx context.Context, a artifact) ([]byte, error) {
 		}
 		txz, err := readZipFile(f)
 		if err != nil {
-			return nil, fmt.Errorf("embedded-dsql: extract %s from %s: %w", f.Name, url, err)
+			return nil, verification{}, fmt.Errorf("embedded-dsql: extract %s from %s: %w", f.Name, url, err)
 		}
-		sum := sha256.Sum256(txz)
-		if got := hex.EncodeToString(sum[:]); got != a.sums.txz {
-			return nil, fmt.Errorf("embedded-dsql: checksum mismatch for %s in %s: got sha256 %s, pinned %s", f.Name, url, got, a.sums.txz)
+		got := sha256Hex(txz)
+		if a.txzSHA256 != "" && got != a.txzSHA256 {
+			return nil, verification{}, fmt.Errorf("embedded-dsql: checksum mismatch for %s in %s: got sha256 %s, pinned %s", f.Name, url, got, a.txzSHA256)
 		}
-		return txz, nil
+		return txz, verification{jar: want, txz: got}, nil
 	}
-	return nil, fmt.Errorf("embedded-dsql: no .txz archive in %s", url)
+	return nil, verification{}, fmt.Errorf("embedded-dsql: no .txz archive in %s", url)
+}
+
+func sha256Hex(b []byte) string {
+	s := sha256.Sum256(b)
+	return hex.EncodeToString(s[:])
 }
 
 func readZipFile(f *zip.File) ([]byte, error) {

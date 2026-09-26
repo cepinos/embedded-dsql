@@ -58,10 +58,13 @@ func detectRunAs() (*runAs, error) {
 
 // binariesDir is where the extracted PostgreSQL binaries live. As root they go
 // to a root-owned directory under the system temp dir, so the unprivileged
-// account can reach them (the cache usually sits under /root).
-func binariesDir(cacheDir string, a artifact, as *runAs) (string, error) {
+// account can reach them (the cache usually sits under /root). The name
+// carries a prefix of the archive's SHA-256, so a different archive for the
+// same version is never served from stale binaries.
+func binariesDir(cacheDir string, a artifact, archiveSHA256 string, as *runAs) (string, error) {
+	name := a.name() + "-" + archiveSHA256[:12]
 	if as == nil {
-		return filepath.Join(cacheDir, "extracted", a.name()), nil
+		return filepath.Join(cacheDir, "extracted", name), nil
 	}
 	parent := filepath.Join(os.TempDir(), "embedded-dsql-root")
 	if err := os.MkdirAll(parent, 0o755); err != nil {
@@ -70,7 +73,7 @@ func binariesDir(cacheDir string, a artifact, as *runAs) (string, error) {
 	if err := checkRootOwnedDir(parent); err != nil {
 		return "", err
 	}
-	return filepath.Join(parent, fmt.Sprintf("%s-uid%d", a.name(), as.uid)), nil
+	return filepath.Join(parent, fmt.Sprintf("%s-uid%d", name, as.uid)), nil
 }
 
 func checkRootOwnedDir(dir string) error {
