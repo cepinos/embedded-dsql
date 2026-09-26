@@ -20,7 +20,8 @@ go get github.com/cepinos/embedded-dsql
 ```
 
 Linux and macOS on amd64 and arm64. The first `Start` downloads the PostgreSQL
-binaries (about 15 MB) from Maven Central; later runs use the cache.
+binaries (about 15 MB) from Maven Central, or the Maven repository you
+configure; later runs use the cache.
 
 ## Usage
 
@@ -73,12 +74,14 @@ func (db *DB) PostgresDSN() string // the PostgreSQL server itself, unvalidated
 func (db *DB) Stop() error         // idempotent; leaves no process behind
 
 type Options struct {
-	CacheDir        string    // default $GOMODCACHE/../embedded-postgres
-	RuntimeDir      string    // default: a fresh temp dir, removed by Stop
-	Port            int       // DSN port; 0 picks a free one
-	PostgresVersion string    // default "16.14.0" (must have a pinned checksum)
-	Logger          io.Writer // PostgreSQL output and proxy errors; default discarded
-	Passthrough     bool      // no proxy: DSN points straight at PostgreSQL
+	CacheDir            string    // default $GOMODCACHE/../embedded-postgres
+	RuntimeDir          string    // default: a fresh temp dir, removed by Stop
+	Port                int       // DSN port; 0 picks a free one
+	PostgresVersion     string    // default "16.14.0"; any zonky version
+	BinaryRepositoryURL string    // default "https://repo1.maven.org/maven2"
+	BinarySHA256        string    // hex SHA-256 of the jar; overrides the pin
+	Logger              io.Writer // PostgreSQL output and proxy errors; default discarded
+	Passthrough         bool      // no proxy: DSN points straight at PostgreSQL
 }
 ```
 
@@ -144,7 +147,7 @@ Inherited from MiniStack's proxy:
   PostgreSQL reports them, for example `40001` on a write conflict under
   `REPEATABLE READ`, not through DSQL's optimistic commit.
 - The server announces `server_version` 16.4 like MiniStack, while the
-  backend runs the pinned PostgreSQL version.
+  backend runs the configured PostgreSQL version.
 
 ### Known differences from MiniStack
 
@@ -168,14 +171,33 @@ what the parity suite sends:
 ## Binaries, cache and root
 
 - The PostgreSQL binaries come from the zonky
-  `embedded-postgres-binaries-<os>-<arch>` jar on Maven Central. Its SHA-256,
-  and that of the `.txz` inside, are **pinned in code** for each supported
-  platform; a mismatch fails loudly with the URL and path. Downloads use
-  `net/http` defaults, so `HTTPS_PROXY` is honoured.
+  `embedded-postgres-binaries-<os>-<arch>` jar, fetched from
+  `<BinaryRepositoryURL>/io/zonky/test/postgres/embedded-postgres-binaries-<os>-<arch>/<version>/`
+  exactly as embedded-postgres builds it. `BinaryRepositoryURL` (default
+  Maven Central) can point at a mirror or proxy; a trailing slash is ignored.
+  Downloads use `net/http` defaults, so `HTTPS_PROXY` is honoured.
+- Any published `PostgresVersion` works. The jar is always verified before
+  use, by the first rule that applies:
+  1. `BinarySHA256` set: the jar must match it.
+  2. The version is pinned for this platform (`16.14.0` on linux and darwin,
+     amd64 and arm64, glibc and Alpine): the jar and the `.txz` inside must
+     match the SHA-256s **pinned in code**, whatever repository served them.
+  3. Otherwise: the jar must match `<jar URL>.sha256` from the same
+     repository. If that file is missing, not HTTP 200 or not a SHA-256
+     digest, Start fails before downloading the jar, naming the URL and the
+     version, and asks for `BinarySHA256` or a pinned version. (embedded-postgres
+     skips verification in that case; embedded-dsql never does.)
+
+  A mismatch fails loudly with the URL and what the checksum was expected
+  from.
 - The archive is written atomically, under a cross-process file lock, to
   `<CacheDir>/embedded-postgres-binaries-<os>-<arch>-<version>.txz`, which is
-  where embedded-postgres looks, so it never downloads by itself. A corrupt
-  cached archive is replaced. Binaries are extracted once to
+  where embedded-postgres looks, so it never downloads by itself. The version
+  is part of the name, so switching versions never reuses another archive. A
+  small `.embedded-dsql` record next to the archive keeps the SHA-256 of the
+  jar it came from and of the archive, so an unpinned version is reused
+  without a download, and a changed `BinarySHA256` downloads again. A corrupt
+  cached archive is replaced. Binaries are extracted once per archive to
   `<CacheDir>/extracted/`. The default `CacheDir` sits next to the Go module
   cache, which CI caches usually persist; the included workflow caches it
   explicitly.
