@@ -19,3 +19,6 @@ go.work.sum
 
 # embedded-postgres runtime/cache
 .embedded-postgres-go/
+
+# Agent report
+.agent-report.md
