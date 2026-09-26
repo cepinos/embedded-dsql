@@ -12,8 +12,8 @@ before it reaches a real cluster.
 
 ## Status
 
-Work in progress. The repository is private and has **no LICENSE yet**,
-deliberately, until ownership and licensing are decided.
+Work in progress: nothing is implemented yet and the API may change.
+No LICENSE file yet — it will be added before the first release.
 
 ## Planned API
 
