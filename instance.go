@@ -35,7 +35,30 @@ func processAlive(pid int) bool {
 		return false
 	}
 	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	if err != nil && !errors.Is(err, syscall.EPERM) {
+		return false
+	}
+	return !isZombie(pid)
+}
+
+// isZombie reports whether pid has exited but was never reaped. pg_ctl
+// daemonizes the postmaster, so once it exits it is the orphan of whatever
+// runs as PID 1; in a container whose PID 1 does not reap orphans it stays
+// a zombie, which kill(pid, 0) still reports as alive. Without procfs
+// (macOS) the kill check stands on its own.
+func isZombie(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	// The state follows the command name, which is parenthesised and may
+	// itself contain spaces or parentheses.
+	end := strings.LastIndexByte(string(data), ')')
+	if end < 0 || end+2 >= len(data) {
+		return false
+	}
+	state := data[end+2]
+	return state == 'Z' || state == 'X'
 }
 
 func readPID(path string) (int, error) {
