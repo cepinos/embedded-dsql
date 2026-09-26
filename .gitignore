@@ -1,0 +1,21 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+/bin/
+
+# Coverage
+*.out
+*.cover
+coverage.*
+*.coverprofile
+
+# Go workspace
+go.work
+go.work.sum
+
+# embedded-postgres runtime/cache
+.embedded-postgres-go/
