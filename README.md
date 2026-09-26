@@ -13,7 +13,6 @@ before it reaches a real cluster.
 ## Status
 
 Work in progress: nothing is implemented yet and the API may change.
-No LICENSE file yet — it will be added before the first release.
 
 ## Planned API
 
@@ -40,3 +39,8 @@ Sketch: `Start(ctx, Options) (dsn string, stop func() error, err error)`.
   ports.
 - **Parity test suite** that runs the same cases against MiniStack to keep the
   two implementations in agreement.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Files ported from MiniStack keep MiniStack's own
+MIT copyright notice.
