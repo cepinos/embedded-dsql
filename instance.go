@@ -115,9 +115,21 @@ func sweepStale(binDir string, logw io.Writer) error {
 // first stops whatever an earlier run left running there.
 func newInstanceDir(explicit, binDir string, as *runAs, logw io.Writer) (instanceLayout, bool, error) {
 	if explicit != "" {
+		explicit, err := filepath.Abs(explicit)
+		if err != nil {
+			return instanceLayout{}, false, fmt.Errorf("embedded-dsql: resolve runtime dir: %w", err)
+		}
 		layout := instanceLayout{root: explicit}
 		if err := os.MkdirAll(explicit, 0o755); err != nil {
 			return layout, false, fmt.Errorf("embedded-dsql: create runtime dir %s: %w", explicit, err)
+		}
+		if as != nil {
+			if err := os.Chmod(explicit, 0o755); err != nil {
+				return layout, false, fmt.Errorf("embedded-dsql: chmod %s: %w", explicit, err)
+			}
+			if err := checkSearchable(filepath.Dir(explicit), as); err != nil {
+				return layout, false, err
+			}
 		}
 		if err := stopLeftover(binDir, layout.data(), logw); err != nil {
 			return layout, false, err
@@ -142,6 +154,26 @@ func newInstanceDir(explicit, binDir string, as *runAs, logw io.Writer) (instanc
 		return layout, true, errors.Join(err, os.RemoveAll(dir))
 	}
 	return layout, true, nil
+}
+
+// checkSearchable reports whether the unprivileged account can traverse dir
+// and every ancestor, which PostgreSQL needs to reach its data directory.
+func checkSearchable(dir string, as *runAs) error {
+	for d := dir; ; d = filepath.Dir(d) {
+		info, err := os.Stat(d)
+		if err != nil {
+			return fmt.Errorf("embedded-dsql: stat %s: %w", d, err)
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		owned := ok && int(st.Uid) == as.uid
+		if info.Mode().Perm()&0o001 == 0 && !owned {
+			return fmt.Errorf("embedded-dsql: running as root, PostgreSQL runs as %s, which cannot reach RuntimeDir "+
+				"through %s (not world-searchable); use a RuntimeDir under a searchable path or leave it empty", as.name, d)
+		}
+		if parent := filepath.Dir(d); parent == d {
+			return nil
+		}
+	}
 }
 
 func writeOwner(l instanceLayout) error {

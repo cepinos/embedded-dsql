@@ -378,7 +378,7 @@ func TestStopLeavesNoProcess(t *testing.T) {
 
 func TestStartStopsALeftoverInstanceOfTheSameDir(t *testing.T) {
 	ctx := testCtx(t)
-	dir := filepath.Join(t.TempDir(), "rt")
+	dir := searchableTempDir(t)
 
 	first, err := Start(ctx, Options{RuntimeDir: dir})
 	require.NoError(t, err)
@@ -395,6 +395,18 @@ func TestStartStopsALeftoverInstanceOfTheSameDir(t *testing.T) {
 	conn := connect(t, second.DSN())
 	var one int
 	require.NoError(t, conn.QueryRow(ctx, `SELECT 1`).Scan(&one))
+}
+
+// searchableTempDir returns a runtime dir PostgreSQL can reach even when the
+// tests run as root and PostgreSQL runs as nobody.
+func searchableTempDir(t *testing.T) string {
+	t.Helper()
+	base := t.TempDir()
+	tmp := filepath.Clean(os.TempDir())
+	for d := base; d != tmp && d != filepath.Dir(d); d = filepath.Dir(d) {
+		require.NoError(t, os.Chmod(d, 0o755))
+	}
+	return filepath.Join(base, "rt")
 }
 
 func TestParallelInstances(t *testing.T) {
